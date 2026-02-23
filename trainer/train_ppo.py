@@ -24,7 +24,7 @@ from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_d
 
 warnings.filterwarnings('ignore')
 
-
+## 当前模型加个线性层去做预估
 # 自定义的Critic模型，继承自MiniMindLM
 class CriticModel(MiniMindForCausalLM):
     def __init__(self, params):
@@ -35,9 +35,9 @@ class CriticModel(MiniMindForCausalLM):
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
         # 使用基础模型获取隐藏状态
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-        hidden_states = self.model.norm(outputs[0])
+        hidden_states = self.model.norm(outputs[0])  ## 为最后一层的隐藏状态
         # 使用value_head获取价值估计
-        values = self.value_head(hidden_states).squeeze(-1)
+        values = self.value_head(hidden_states).squeeze(-1)  ## 转为单个值
         return values
 
 
@@ -78,25 +78,25 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         rewards += torch.tensor(mark_rewards, device=args.device)
         return rewards
 
-    rewards = torch.zeros(len(responses), device=args.device)
+    rewards = torch.zeros(len(responses), device=args.device) ## 有几条回复就有几个0   【0，0，0】
 
     # 格式奖励
-    if args.reasoning == 1:
+    if args.reasoning == 1: ## 只针对推理模型使用 -- 先跳过
         rewards = reasoning_model_reward(rewards)
 
-    # 使用reward model计算整个response的奖励
+    # 使用reward model计算整个response的奖励  这里重要
     with torch.no_grad():
         reward_model_scores = []
         for prompt, response in zip(prompts, responses):
             pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
             matches = re.findall(pattern, prompt, re.DOTALL)
-            messages = [{"role": role, "content": content.strip()} for role, content in matches]
+            messages = [{"role": role, "content": content.strip()} for role, content in matches]  
 
-            tmp_chat = messages + [{"role": "assistant", "content": response}]
-            score = reward_model.get_score(reward_tokenizer, tmp_chat)
+            tmp_chat = messages + [{"role": "assistant", "content": response}]  ## 标准化 把短信变成 messages = [{"role": "system", "content": "Hello"}, {"role": "user", "content": "How are you?"}]
+            score = reward_model.get_score(reward_tokenizer, tmp_chat)  ## 预训练好达到模型做打分
 
             scale = 3.0
-            score = max(min(score, scale), -scale)
+            score = max(min(score, scale), -scale)  ## 算分数  【-3，3】
 
             # 当args.reasoning=1时，额外计算<answer>内容的奖励
             if args.reasoning == 1:
@@ -111,7 +111,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
             reward_model_scores.append(score)
 
         reward_model_scores = torch.tensor(reward_model_scores, device=args.device)
-        rewards += reward_model_scores
+        rewards += reward_model_scores  #【-1，2，3】 具体的分数  只拿最后一个每个response的最后一个token做分数
 
     return rewards
 
@@ -124,56 +124,61 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         prompts = batch["prompt"]  # list[str], length B
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
                        max_length=args.max_seq_len, padding_side="left").to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
-        prompt_length = enc.input_ids.shape[1]
+        prompt_length = enc.input_ids.shape[1]  ## [B, P] 取P看有多少个token
+        ##以上是把prompt转成token
 
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
-            model_for_gen = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
+            model_for_gen = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model  ## 使用模型rollout
             gen_out = model_for_gen.generate(
                 input_ids=enc.input_ids, attention_mask=enc.attention_mask,
                 max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
-                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
+                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]  这里是使用actor模型生成response，直接转成id来的
 
-        responses_text = [tokenizer.decode(gen_out[i, prompt_length:], skip_special_tokens=True) for i in range(len(prompts))]
-        rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
+        responses_text = [tokenizer.decode(gen_out[i, prompt_length:], skip_special_tokens=True) for i in range(len(prompts))]  ## 这里是把response decode成字符串文本
+        rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]  把prompt+response文本拿来一起做打分，算出最终结果的reward！！！ 每一条response 一个reward
 
-        full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
-        values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
+        full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]  padding_mask
+        values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]  用critic模型来预估value
         last_indices = (full_mask * torch.arange(full_mask.size(1), device=gen_out.device)).argmax(dim=1)
-        values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
-        advantages = rewards - values.detach()  # [B]
-
+        values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]  同样也是取每个response的最后一个token 来估计value
+        advantages = rewards - values.detach()  # [B] 算优势！！！  工程上在RLHF里我们认为最后一个token的reward就是总的reward，即为实际上最后的结果；因为大模型里其他token都为0，在这里只关心最后结果，这是建模的选择
+                                                  ## 所以在RLHF里没有当前状态的预期，只有最终结果的预期，所以critic在这预测的是最终的value
+        
+        ## 以下为actor更新部分
         with autocast_ctx:
             res = actor_model(input_ids=gen_out, attention_mask=full_mask)
-            logits = res.logits  # [B, P+R, V]
-            aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
+            logits = res.logits  # [B, P+R, V]  这里是求出prompt+response的hidden_state 即最后的输出
+            aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)  
         
-        labels = gen_out[:, 1:].clone()  # [B, P+R-1]
-        logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-        seq_len = gen_out.size(1) - 1
-        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_length - 1
-        final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
-        actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
+        labels = gen_out[:, 1:].clone()  # [B, P+R-1]  拿到label
+        logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]  得到每个真实token的log_prob
+        seq_len = gen_out.size(1) - 1  ## 只计算序列长度 
+        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_length - 1  ## 只计算 response 部分的 log probability，prompt 的 token 不算在 reward 里。
+        final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]  ## mask掉pad token，防止它们对 loss/gradient 产生影响
+        actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B] 得到每句话 每个样本log pro的和 即整个 response 的 log probability  这是当前策略的结果
 
         with torch.no_grad():
-            old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
+            old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]  
             old_logp_tokens = F.log_softmax(old_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-            old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
+            old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]  这里是拿到旧策略对应 整个response 的 log probability
             
             ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             ref_logp_tokens = F.log_softmax(ref_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-            ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
+            ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]   这里是拿到ref model对应 整个response 的 log probability
 
-        kl = (actor_logp - old_logp).mean()  # scalar
-        kl_ref = (actor_logp - ref_logp).mean()  # scalar
-        ratio = torch.exp(actor_logp - old_logp)  # [B]
-        surr1 = ratio * advantages  # [B]
-        surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
-        policy_loss = -torch.min(surr1, surr2).mean()  # scalar
-        value_loss = F.mse_loss(values, rewards)  # scalar
-        loss = (policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref + aux_loss) / args.accumulation_steps  # scalar
+        kl = (actor_logp - old_logp).mean()  # scalar  跟旧策略的离散度
+        kl_ref = (actor_logp - ref_logp).mean()  # scalar  跟ref_model的离散度
+        ratio = torch.exp(actor_logp - old_logp)  # [B]  PPO 核心公式的ratio
+        surr1 = ratio * advantages  # [B] 优势*比值
+        surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]  clip限制 将ratio限制在 [1 - ε, 1 + ε]
+        policy_loss = -torch.min(surr1, surr2).mean()  # scalar  取最小值
+        value_loss = F.mse_loss(values, rewards)  # scalar  算critic模型的loss
+        loss = (policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref + aux_loss) / args.accumulation_steps  # scalar  这里是实现clip
         loss.backward()
 
+
+        ## 累计梯度再做更新
         if (step + 1) % args.accumulation_steps == 0:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
@@ -219,9 +224,9 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                    f"Reward: {reward_val:.4f}, KL: {kl_val:.4f}, KL_ref: {kl_ref_val:.4f}, "
                    f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.8f}, Critic LR: {critic_lr:.8f}")
 
-        if (step + 1) % args.update_old_actor_freq == 0:
-            state_dict = actor_model.module.state_dict() if isinstance(actor_model, DistributedDataParallel) else actor_model.state_dict()
-            old_actor_model.load_state_dict({k: v.detach().cpu() for k, v in state_dict.items()})
+        if (step + 1) % args.update_old_actor_freq == 0:   ## 旧actor的更新会滞后几步!!!
+            state_dict = actor_model.module.state_dict() if isinstance(actor_model, DistributedDataParallel) else actor_model.state_dict()  ## 旧actor的更新会滞后几步
+            old_actor_model.load_state_dict({k: v.detach().cpu() for k, v in state_dict.items()})  ## 
             old_actor_model.to(args.device)
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
@@ -310,14 +315,14 @@ if __name__ == "__main__":
     # Reference模型
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
-    # Critic模型
+    # Critic模型  ## 加一层线性层
     moe_suffix = '_moe' if lm_config.use_moe else ''
     ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
     critic_model = CriticModel(lm_config)
     critic_model.load_state_dict(state_dict, strict=False)
     critic_model = critic_model.to(args.device)
-    # Reward模型
+    # Reward模型  预训练好
     reward_model = AutoModel.from_pretrained(
         args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
     )

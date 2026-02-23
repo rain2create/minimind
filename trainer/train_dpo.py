@@ -21,6 +21,7 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 warnings.filterwarnings('ignore')
 
 
+## 这里是拿对应label的log概率！！！
 def logits_to_log_probs(logits, labels):
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
@@ -30,14 +31,15 @@ def logits_to_log_probs(logits, labels):
     return log_probs_per_token
 
 
+## 先聚合算response级别上的loss 最后聚合算整个batch上面的！！！
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
-    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
-    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
-    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN  seq_lengths拿到每个样本的真是token数量
+    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()  ## 这里是算 平均 token log probability  只拿answer的log 
+    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze() ## 平均的token log probability   只拿answer的log
 
-    # 将 chosen 和 rejected 数据分开
+    # 将 chosen 和 rejected 数据分开 然后做减法
     batch_size = ref_log_probs.shape[0]
     chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
@@ -45,41 +47,46 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
-    ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
-    logits = pi_logratios - ref_logratios
-    loss = -F.logsigmoid(beta * logits)
+    ref_logratios = chosen_ref_log_probs - reject_ref_log_probs  
+    logits = pi_logratios - ref_logratios   
+    loss = -F.logsigmoid(beta * logits)   
     return loss.mean()
 
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
     start_time = time.time()
     
+    ## 做对比的数据集
     for step, batch in enumerate(loader, start=start_step + 1):
-        x_chosen = batch['x_chosen'].to(args.device)
-        x_rejected = batch['x_rejected'].to(args.device)
-        y_chosen = batch['y_chosen'].to(args.device)
-        y_rejected = batch['y_rejected'].to(args.device)
-        mask_chosen = batch['mask_chosen'].to(args.device)
-        mask_rejected = batch['mask_rejected'].to(args.device)
+        x_chosen = batch['x_chosen'].to(args.device)  ## prompt + response 
+        x_rejected = batch['x_rejected'].to(args.device) ## prompt + response 
+        y_chosen = batch['y_chosen'].to(args.device)  ## 对应的label 既  输入平移+eos
+        y_rejected = batch['y_rejected'].to(args.device)  ## 对应的label 既  输入平移+eos
+        mask_chosen = batch['mask_chosen'].to(args.device) ## mask掉对应的prompt
+        mask_rejected = batch['mask_rejected'].to(args.device)  ## mask掉对应的prompt
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
 
+        ## 做warmup学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        ## 拿ref model对应label的log概率
         with autocast_ctx:
             with torch.no_grad():
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits
-            ref_log_probs = logits_to_log_probs(ref_logits, y)
+            ref_log_probs = logits_to_log_probs(ref_logits, y) ## 拿label的概率
             
+            ## 拿actor主模型对应label的log概率
             outputs = model(x)
             logits = outputs.logits
-            policy_log_probs = logits_to_log_probs(logits, y)
+            policy_log_probs = logits_to_log_probs(logits, y) ## 拿label的概率
             
-            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+
+            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta) ## 算loss  先聚合算response级别上的loss 最后聚合算整个batch上面的！！！
             loss = dpo_loss_val + outputs.aux_loss
             loss = loss / args.accumulation_steps
 

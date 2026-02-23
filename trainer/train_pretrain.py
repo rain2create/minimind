@@ -1,8 +1,21 @@
+# pip config set global.cache-dir D:\pip_cache
+
+# # PyTorch/Transformers 指定缓存路径（运行前设置环境变量）
+# set TRANSFORMERS_CACHE=D:\huggingface_cache
+# set HF_HOME=D:\huggingface_cache
+# set TORCH_HOME=D:\torch_cache
+
+# 或在代码开头
+import os
+os.environ['TRANSFORMERS_CACHE'] = 'D:/huggingface_cache'
+
 import os
 import sys
-
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+os.environ['TMP'] = 'D:\\temp'
+os.environ['TEMP'] = 'D:\\temp'
+os.environ['TORCH_EXTENSIONS_DIR'] = 'D:\\temp\\torch_extensions'
 
 import argparse
 import time
@@ -21,13 +34,13 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    loss_fct = nn.CrossEntropyLoss(reduction='none') ## 交叉熵
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
         X = X.to(args.device)
         Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        loss_mask = loss_mask.to(args.device)  ## mask掉padding的token
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)  ## 动态更新 warm_up learning rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -35,24 +48,25 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             res = model(X)
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
-                Y.view(-1)
-            ).view(Y.size())
+                Y.view(-1)  ## res (batch_size * seq_len, vocab_size) vs. Y (batch_size,seq_len) 去求交叉熵
+            ).view(Y.size())  ##  最后reshape 回 (batch_size,seq_len)
 
             logits_loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss = logits_loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            loss = logits_loss + res.aux_loss  ## 加上辅助loss
+            loss = loss / args.accumulation_steps  ## 得到总的loss
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward()  # 算梯度
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if (step + 1) % args.accumulation_steps == 0:  ## 这里做累计梯度，每几次再更新一次 zero-gradient, 累计8次
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  ## 防止梯度爆炸 所以做裁剪
 
             scaler.step(optimizer)
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
 
+        ## 打印日志 50个step打印一次日志
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -65,6 +79,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
+        ## 判断是否保存模型 以及切换到评估模式
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -99,7 +114,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_moe', default=1, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -133,9 +148,23 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)   ## 加载数据集
+    train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None  ## 分布式采样器，如果有多张卡可用 但这里没有
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16')) 
+
+## 这里是混合精度训练 减少显存占用，如果是单精度就是float32
+
+    """  
+
+    这里使用 float16 可以减少显存占用，加快训练速度。
+    但是 float16 数值范围小，容易出现梯度下溢（梯度为 0）或梯度溢出。
+
+    GradScaler 的作用：
+    1. 自动放大梯度（scale）以避免下溢。
+    2. 在反向传播后自动缩放回正确值。
+    3. 遇到梯度溢出时，跳过该步更新，保证训练稳定。
+                      
+    """
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
@@ -152,12 +181,13 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
+
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)  
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
         else: # 默认从头开始
@@ -166,3 +196,5 @@ if __name__ == "__main__":
     
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()
+
+

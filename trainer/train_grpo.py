@@ -52,7 +52,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         rewards += torch.tensor(mark_rewards, device=args.device)
         return rewards
 
-    rewards = torch.zeros(len(responses), device=args.device)
+    rewards = torch.zeros(len(responses), device=args.device)  ## 有几条回答采样，就构造多大的zero矩阵
     if args.reasoning == 1:
         rewards = reasoning_model_reward(rewards)
 
@@ -62,17 +62,17 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         scale = 3.0
 
         for i in range(batch_size):
-            for j in range(args.num_generations):
+            for j in range(args.num_generations):  ## 一条prompt对应多个response
                 response_idx = i * args.num_generations + j
-                response = responses[response_idx]
+                response = responses[response_idx] #标注当下response的索引
                 prompt = prompts[i]
 
                 pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
                 matches = re.findall(pattern, prompt, re.DOTALL)
                 messages = [{"role": role, "content": content.strip()} for role, content in matches]
 
-                tmp_chat = messages + [{"role": "assistant", "content": response}]
-                score = reward_model.get_score(reward_tokenizer, tmp_chat)
+                tmp_chat = messages + [{"role": "assistant", "content": response}]  ## 把对应的采样response拼成一个完整的问答
+                score = reward_model.get_score(reward_tokenizer, tmp_chat)  ## 并以此来打分
                 score = max(min(score, scale), -scale)
 
                 if args.reasoning == 1:
@@ -96,55 +96,59 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch['prompt']  # list[str], length B
         prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False,
-                                  padding_side="left", add_special_tokens=False).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
+                                  padding_side="left", add_special_tokens=False).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]  讲prompt转成id
         if args.max_seq_len:
-            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
-            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]
+            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]  ## 截断后面保留前面  因为越后面的token越重要 节省显存
+            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]  ## 截断后面保留前面  因为越后面的token越重要
 
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
-            model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
+            model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model ## 这里是主模型
             outputs = model_for_gen.generate(
                 **prompt_inputs, max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
-                num_return_sequences=args.num_generations, pad_token_id=tokenizer.pad_token_id)  # [B*num_gen, P+R]
+                num_return_sequences=args.num_generations, pad_token_id=tokenizer.pad_token_id)  # [B*num_gen, P+R]  这里是每个prompt生成num_generations个response 并把他们转成id
 
-        completion_ids = outputs[:, prompt_inputs["input_ids"].size(1):]  # [B*num_gen, R]
+        completion_ids = outputs[:, prompt_inputs["input_ids"].size(1):]  # [B*num_gen, R]  只保留answer部分
         
-        def get_per_token_logps(mdl, input_ids, n_keep):
+        def get_per_token_logps(mdl, input_ids, n_keep):## 返回每个response其中每个token对应label的概率
             input_ids = input_ids.detach().clone() if input_ids.is_inference() else input_ids
-            logits = mdl(input_ids, logits_to_keep=n_keep + 1).logits[:, :-1, :]
+            logits = mdl(input_ids, logits_to_keep=n_keep + 1).logits[:, :-1, :]  ## 返回的shape是 （B*num_gen,R-1,vob_size)  这里只要response的概率！！！
             per_token_logps = []
             for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:]):
                 ids_row = ids_row.detach().clone() if ids_row.is_inference() else ids_row
-                per_token_logps.append(torch.gather(logits_row.log_softmax(dim=-1), 1, ids_row.unsqueeze(1)).squeeze(1))
+                per_token_logps.append(torch.gather(logits_row.log_softmax(dim=-1), 1, ids_row.unsqueeze(1)).squeeze(1))  ## softmax之后取对应label的概率  这里只是response的概率！！
             return torch.stack(per_token_logps)
 
         with autocast_ctx:
-            per_token_logps = get_per_token_logps(model, outputs, completion_ids.size(1))  # [B*num_gen, R]
+            per_token_logps = get_per_token_logps(model, outputs, completion_ids.size(1))  # [B*num_gen, R-1]  response里每个token的概率  主模型
             res = model(outputs) if lm_config.use_moe else None
             aux_loss = res.aux_loss if res is not None else torch.tensor(0.0, device=args.device)
         
         with torch.no_grad():
-            ref_per_token_logps = get_per_token_logps(ref_model, outputs, completion_ids.size(1))  # [B*num_gen, R]
+            ref_per_token_logps = get_per_token_logps(ref_model, outputs, completion_ids.size(1))  # [B*num_gen, R-1]  拿ref模型的对应每个token的概率
 
-        completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        rewards = calculate_rewards(prompts, completions, reward_model, reward_tokenizer).to(args.device)  # [B*num_gen]
+        completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)  ## response转换成字符串 方面后续算rewards
+        rewards = calculate_rewards(prompts, completions, reward_model, reward_tokenizer).to(args.device)  # [B*num_gen]  每个response都有一个reward
 
-        grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
-        mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
-        std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
-        advantages = torch.clamp((rewards - mean_r) / (std_r + 1e-4), -10, 10)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # [B*num_gen]
+        grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]  换shape
+        mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]  求一个组里reward的均值再做重复
+        std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]  一个组里reward的std再做重复
+        advantages = torch.clamp((rewards - mean_r) / (std_r + 1e-4), -10, 10)   ## [B*num_gen]  算正常的grpo的advantage
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # [B*num_gen]  ## 再把advantage做一次标准化
 
-        is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R]
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
+        is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R] 生成是否是eos的mask
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)  ## 初始化向量 [B*num_gen]  长度为B*num_gen 每个值为R
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        completion_mask = (torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)).int()  # [B*num_gen, R]
+        completion_mask = (torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)).int()  # [B*num_gen, R] 根据eos 只保留有效序列的mask
 
-        kl_div = ref_per_token_logps - per_token_logps
-        per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
-        per_token_loss = -(torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1) - args.beta * per_token_kl)  # [B*num_gen, R]
-        policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+        ## GRPO 先算token的loss 再聚合算整个response的，最后聚合在batch维度上！！！
+        kl_div = ref_per_token_logps - per_token_logps  
+        per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]  算kl
+        per_token_loss = -(torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1) - args.beta * per_token_kl)  # [B*num_gen, R]  GRPO在token级别上的loss
+        ## 这里的detach是停止做梯度更新  但这里其实这么写是有问题的 应该另设old_policy  GRPO的目标函数就是 当前策略概率/旧策略概率*A - KL离散！！！
+
+        policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()  ## 算整条response的回复
         loss = (policy_loss + aux_loss) / args.accumulation_steps  # scalar
         loss.backward()
 
